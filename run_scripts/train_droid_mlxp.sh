@@ -4,7 +4,11 @@
 # -----------------------------------------------------------------------------------------------------
 #   task     : configs/task/droid_fastwam_5b_b128_200k.yaml  (data=droid_wan22_5b, model=fastwam_droid)
 #   mode     : uncond FastWAM = "first-frame" Fast-WAM (fastwam.runtime.create_fastwam), no test-time imagination
-#   batch    : PER_DEV x NUM_GPUS x GA = 32 x 4 x 1 = 128 (OOM_FALLBACK=1: +grad-ckpt; =2: pd16 x GA2 + grad-ckpt)
+#   batch    : PER_DEV x NUM_GPUS x GA = 128 always; the plate is chosen by the OOM level (state file
+#              $PREP_DIR/oom_level, default 0):  L0 pd32/GA1  L1 pd32/GA1+grad-ckpt  L2 pd16/GA2+grad-ckpt
+#              L3 pd8/GA4+grad-ckpt. After a non-zero exit whose log carries a memory-failure signature the
+#              launcher writes level+1 to the state file, so the next pod attempt (backoffLimit) uses the next
+#              plate. Other failures never escalate. $OOM_FALLBACK (yaml env) acts as a floor, $OOM_LEVEL_OVERRIDE forces.
 #   ckpt     : $MODEL_OUTPUT_DIR/<run>/checkpoints/{weights/step_NNNNNN.pt, state/step_NNNNNN/} every 1000, keep 5
 #   resume   : automatic — newest state/step_* dir that contains trainer_state.json -> `resume=<dir>`
 #              (accelerate.load_state: DiT + ZeRO-1 optimizer + LR sched; trainer_state.json: step/epoch/
@@ -34,6 +38,10 @@ else
 fi
 echo "[$TAG] launcher START $(date -u +%FT%TZ) host=$(hostname) log=$L.{out,err}"
 fatal() { echo "[$TAG] FATAL: $*"; echo "[$TAG] rc=1 $(date -u +%FT%TZ)"; exit 1; }
+# memory-failure signature (defined before `set -x` and only used with xtrace off, so it can never match itself)
+OOM_RE='CUDA out of memory|OutOfMemoryError|std::bad_alloc|Killed'
+OOM_LEVEL_FILE="$PREP_DIR/oom_level"
+OOM_LEVEL_MAX=3
 # wandb: decided BEFORE `set -x` so the key value never reaches the log (xtrace would echo the comparison)
 export WANDB_ENTITY="${WANDB_ENTITY:-huiwoen0516}" WANDB_PROJECT=fastwam WANDB_RUN_ID="$RUN_NAME" WANDB_RESUME=allow
 WANDB_MODE_OVERRIDE=()
@@ -43,15 +51,33 @@ if [ -z "${WANDB_API_KEY:-}" ] || [[ "${WANDB_API_KEY:-}" == REPLACE_WITH* ]]; t
 fi
 set -x
 
-# ── batch plate ─────────────────────────────────────────────────────────────────────────────────────
+# ── batch plate, chosen by the OOM level ────────────────────────────────────────────────────────────
 NUM_GPUS="${NUM_GPUS:-4}"
-PER_DEV="${PER_DEV:-32}"; GA="${GA:-1}"; GC="${GC:-false}"
-case "${OOM_FALLBACK:-0}" in
-  0) ;;
-  1) GC=true ;;                    # same batch, activation checkpointing in every MoT block
-  2) PER_DEV=16; GA=2; GC=true ;;  # half micro-batch, 2x accumulation (see GA note below)
-  *) fatal "OOM_FALLBACK must be 0/1/2" ;;
+mkdir -p "$PREP_DIR"
+LEVEL_FROM_FILE=0
+if [ -s "$OOM_LEVEL_FILE" ]; then
+  v="$(tr -dc '0-9' < "$OOM_LEVEL_FILE")"; [ -n "$v" ] && LEVEL_FROM_FILE=$((10#$v))
+fi
+OOM_LEVEL=$LEVEL_FROM_FILE
+LEVEL_FLOOR="${OOM_FALLBACK:-0}"; [[ "$LEVEL_FLOOR" =~ ^[0-9]+$ ]] || fatal "OOM_FALLBACK must be an integer"
+[ "$LEVEL_FLOOR" -gt "$OOM_LEVEL" ] && OOM_LEVEL=$LEVEL_FLOOR
+if [ -n "${OOM_LEVEL_OVERRIDE:-}" ]; then OOM_LEVEL=$((10#$OOM_LEVEL_OVERRIDE)); fi
+[ "$OOM_LEVEL" -le "$OOM_LEVEL_MAX" ] || fatal "OOM level $OOM_LEVEL > max $OOM_LEVEL_MAX (state file $OOM_LEVEL_FILE)"
+case "$OOM_LEVEL" in
+  0) PER_DEV=32; GA=1; GC=false ;;   # default plate
+  1) PER_DEV=32; GA=1; GC=true ;;    # + activation checkpointing in every MoT block
+  2) PER_DEV=16; GA=2; GC=true ;;    # half micro-batch, 2x accumulation
+  3) PER_DEV=8;  GA=4; GC=true ;;    # quarter micro-batch, 4x accumulation
 esac
+if [ "$GA" -gt 1 ]; then
+  export ALLOW_GA_GT1=1
+  echo "[$TAG] ################################################################################################"
+  echo "[$TAG] # OOM LEVEL $OOM_LEVEL: GA=$GA > 1 on the pinned deepspeed 0.18.7 (ZeRO-1). Our DreamZero/WAM notes flag GA>1  #"
+  echo "[$TAG] # bugs in 0.17.x (#7718, ZeRO-2) and a #8224 regression in 0.18.3-0.19.5 -- ZeRO-1 GA>1 is UNVERIFIED here. #"
+  echo "[$TAG] # Check train/loss continuity vs the last L0/L1 checkpoint and consider deepspeed >= 0.19.6.               #"
+  echo "[$TAG] ################################################################################################"
+fi
+echo "[$TAG] OOM level: file=$LEVEL_FROM_FILE floor(OOM_FALLBACK)=$LEVEL_FLOOR override=${OOM_LEVEL_OVERRIDE:-none} -> resolved L$OOM_LEVEL: pd$PER_DEV x GA$GA grad_ckpt=$GC (state file $OOM_LEVEL_FILE, max L$OOM_LEVEL_MAX)"
 MAX_STEPS="${MAX_STEPS:-200000}"; SAVE_EVERY="${SAVE_EVERY:-1000}"; SAVE_LIMIT="${SAVE_LIMIT:-5}"; NW="${NW:-12}"
 EXPECT_EFF="${EXPECT_EFF:-128}"
 EFF=$(( PER_DEV * NUM_GPUS * GA ))
@@ -154,7 +180,7 @@ if [ -n "$RESUME_DIR" ]; then
   RESUME_ARGS=("resume=$RESUME_DIR")
 fi
 
-echo "[$TAG] BANNER eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} | grad_ckpt=$GC | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
+echo "[$TAG] BANNER oom_level=L$OOM_LEVEL eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} | grad_ckpt=$GC | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
 
 # ── train (mirrors scripts/train_zero1.sh, but with a FIXED output_dir so resume is possible) ────────
 accelerate launch \
@@ -171,5 +197,24 @@ accelerate launch \
   ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"} \
   "$@"
 rc=$?
+set +x
+# ── self-escalation: a memory failure in THIS attempt's log bumps the plate for the next pod attempt ──
+if [ "$rc" -ne 0 ]; then
+  sync; sleep 3
+  HIT="$(grep -a -m1 -E "$OOM_RE" "$L.err" "$L.out" 2>/dev/null | head -n1 | cut -c1-300)"
+  if [ -n "$HIT" ]; then
+    if [ "$OOM_LEVEL" -lt "$OOM_LEVEL_MAX" ]; then
+      NEXT=$((OOM_LEVEL + 1))
+      printf '%s\n' "$NEXT" > "$OOM_LEVEL_FILE.tmp" && mv -f "$OOM_LEVEL_FILE.tmp" "$OOM_LEVEL_FILE"
+      echo "$(date -u +%FT%TZ) rc=$rc L$OOM_LEVEL->L$NEXT log=$L signature=${HIT}" >> "$OOM_LEVEL_FILE.log"
+      echo "[$TAG] OOM-ESCALATE: memory-failure signature found (rc=$rc) at L$OOM_LEVEL -> wrote L$NEXT to $OOM_LEVEL_FILE; the next pod attempt resumes from the newest checkpoint with the L$NEXT plate"
+    else
+      echo "$(date -u +%FT%TZ) rc=$rc L$OOM_LEVEL (max, no escalation) log=$L signature=${HIT}" >> "$OOM_LEVEL_FILE.log"
+      echo "[$TAG] OOM-ESCALATE: memory-failure signature found (rc=$rc) but already at max level L$OOM_LEVEL_MAX -> no escalation; intervene by hand"
+    fi
+  else
+    echo "[$TAG] rc=$rc without a memory-failure signature in $L.{err,out} -> OOM level stays L$OOM_LEVEL"
+  fi
+fi
 echo "[$TAG] rc=$rc $(date -u +%FT%TZ)"
 exit $rc

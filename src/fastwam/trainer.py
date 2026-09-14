@@ -602,6 +602,12 @@ class Wan22Trainer:
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            # dataloader position in SAMPLES: batch_in_epoch counts dataloader micro-batches of the plate that
+            # wrote this file; samples_in_epoch lets a resume with another batch_size/GA keep the same position
+            "samples_in_epoch": int(self.batch_in_epoch * self.batch_size * self.accelerator.num_processes),
+            "batch_size": int(self.batch_size),
+            "num_processes": int(self.accelerator.num_processes),
+            "gradient_accumulation_steps": int(self.gradient_accumulation_steps),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -669,14 +675,29 @@ class Wan22Trainer:
 
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
-                self.batch_in_epoch = int(payload["batch_in_epoch"])
+                samples_per_batch = self.batch_size * self.accelerator.num_processes
                 self.train_sampler.set_epoch_offset(self.epoch)
-                self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
+                if "samples_in_epoch" in payload:
+                    sample_offset = int(payload["samples_in_epoch"])
+                    self.batch_in_epoch = sample_offset // samples_per_batch
+                    self.train_sampler.set_resume_sample_offset(sample_offset)
+                    saved_bs = int(payload.get("batch_size", self.batch_size))
+                    saved_ga = int(payload.get("gradient_accumulation_steps", self.gradient_accumulation_steps))
+                    if saved_bs != self.batch_size or saved_ga != self.gradient_accumulation_steps:
+                        logger.warning(
+                            "Resuming with a different plate: checkpoint pd%d/GA%d -> now pd%d/GA%d; "
+                            "data position kept at sample %d (effective batch must be unchanged).",
+                            saved_bs, saved_ga, self.batch_size, self.gradient_accumulation_steps, sample_offset,
+                        )
+                else:
+                    self.batch_in_epoch = int(payload["batch_in_epoch"])
+                    sample_offset = self.batch_in_epoch * samples_per_batch
+                    self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
                 logger.info(
                     "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
                     self.epoch,
                     self.batch_in_epoch,
-                    self.batch_in_epoch * self.batch_size * self.accelerator.num_processes,
+                    sample_offset,
                 )
             else:
                 self.epoch = 0
