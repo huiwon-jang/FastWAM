@@ -1,0 +1,163 @@
+# ==============================================================================================
+# FastWAM x DROID — Wan2.2-TI2V-5B "first-frame" Fast-WAM (uncond) — MLXP single node, 4x H200, eff. batch 128,
+# 200K steps — BACKGROUND-class Job (parked/killed at will; the launcher's auto-resume makes retries safe)
+# ----------------------------------------------------------------------------------------------
+#   repo     : /data/huiwon/fastwam  (clone of https://github.com/yuantianyuan01/FastWAM @ 7faa711, branch
+#              huiwon/droid-mlxp; own .venv python 3.10: torch 2.7.1+cu128, deepspeed 0.18.7, accelerate 1.12.0,
+#              transformers 4.49.0, torchcodec 0.4.0+cu128)
+#   launcher : run_scripts/train_droid_mlxp.sh  (preflight gates + one-time prep + auto-resume + accelerate launch)
+#   task     : configs/task/droid_fastwam_5b_b128_200k.yaml -> data=droid_wan22_5b, model=fastwam_droid
+#   TARGET (our WAM DROID str3h24 recipe) -> FastWAM mapping:
+#     video stride 3 / action horizon 24 @15Hz  -> num_frames=25, action_video_freq_ratio=3 (9 video frames, 24 actions)
+#     3 cams tmosaic wrist 192x320 + ext 96x160 -> concat_multi_camera=tmosaic, video_size 288x320 (new mode, same canvas)
+#     rel joint(7)+abs gripper(1), q01/q99      -> DroidJointGripperTransform + norm_default_mode q01/q99
+#     LR 1e-4, wd 0.01, cosine, warmup 5%, bf16 -> learning_rate/weight_decay/lr_scheduler_type/mixed_precision
+#     eff batch 128, 200K steps                 -> batch_size 32 x 4 gpu x GA 1, max_steps 200000
+#     min-lr ratio 0.1                          -> NOT mappable: trainer hard-codes eta_min = 0.01 * lr (FastWAM default kept)
+#     save every 1000 keep 5                    -> save_every 1000, save_total_limit 5 (new trainer knob)
+#   FastWAM defaults kept: ActionDiT 1024 hdim/30 layers/24 heads, backbone = linear-interp Wan2.2 DiT (alpha
+#     scaled), video shift 5.0, action shift 1.0, AdamW betas (0.9,0.95), grad clip 1.0, DeepSpeed ZeRO-1,
+#     lambda_action 1.0, first_frame_causal video mask, no image aug, no text dropout.
+#   weights  : /data/huiwon/checkpoints/fastwam_base/Wan-AI/Wan2.2-TI2V-5B -> symlink to /data/huiwon/checkpoints/
+#              Wan2.2-TI2V-5B (DiT 3 shards + Wan2.2_VAE.pth + models_t5_umt5-xxl-enc-bf16.pth), tokenizer symlink
+#              Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl -> Wan2.2-TI2V-5B/google/umt5-xxl. No downloads (DIFFSYNTH_SKIP_DOWNLOAD).
+#   data     : /data/shared_dataset/DreamZero-DROID-Data read-only (LeRobot v2.0, loads as-is). Derived artifacts go to
+#              /data/huiwon/data/droid_fastwam/{dataset_stats.json,text_embeds_cache/} and the ActionDiT .pt next to the weights.
+#   ckpt     : $MODEL_OUTPUT_DIR/fastwam_droid_wan22_5b_b128_200k_4gpu/checkpoints/{weights/step_N.pt,state/step_N/}
+#   resume   : automatic (launcher picks the newest complete state/step_* and passes resume=<dir>)
+#   logs     : /data/huiwon/logs/gr00t-vdm/fastwam-droid-wan22-5b-b128-200k-4gpu-<ts>.{out,err}
+#   background-class: mlxp/job-class=background on Job AND template; backoffLimit 20 (+ podFailurePolicy that
+#     does not charge DisruptionTarget evictions to the budget). MLXP fair-share suspension deletes the pod and
+#     sets .spec.suspend=true -> pod is recreated (and resumes) only once the job is un-suspended (report only,
+#     per policy). A plain kill/eviction -> Job controller recreates the pod immediately -> launcher resumes.
+#   NOT GPU-tested (written 2026-09-14: server dry-run + bash -n + py_compile + hydra compose smoke on the debug pod).
+#   OOM fallback: set OOM_FALLBACK=1 (grad-ckpt) or 2 (pd16 x GA2 + grad-ckpt, needs ALLOW_GA_GT1=1) in the env below.
+# ==============================================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: huiwon-fastwam-droid-wan22-5b-b128-200k-4gpu-bg
+  namespace: p-rlwrld
+  labels:
+    mlxp/job-class: background
+    project-code: sub_wam
+    project-short-name: sub_wam
+spec:
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 300
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  podReplacementPolicy: Failed
+  podFailurePolicy:
+    rules:
+      # evictions / preemptions (node drain, scheduler preemption) are not counted against backoffLimit
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+  template:
+    metadata:
+      annotations:
+        # BOTH zone markers are load-bearing: without the zone annotation the MLXP pod-admission
+        # webhook falls back to zone "test" and denies every pod (FailedCreate loop).
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+      labels:
+        mlxp/job-class: background
+        project-code: sub_wam
+        project-short-name: sub_wam
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mlx.navercorp.com/hardware-type: gpu
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      # No kubernetes.io/hostname affinity on purpose (MLXP resource convention 2026-09-06).
+      imagePullSecrets:
+        - name: mlxp-registry
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: train
+          image: mlxp.kr.ncr.ntruss.com/taeyoung/groot:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            # MLXP enforcement: MODEL_OUTPUT_DIR MUST be a spec.env literal (a container-side export is
+            # not seen by the scheduler check -> suspend-kill).
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/huiwon/fastwam
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: GLOO_SOCKET_FAMILY
+              value: AF_INET
+            - name: LD_PRELOAD
+              value: /data/libipv4_force_v2.so
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+            - name: WANDB_API_KEY
+              value: REPLACE_WITH_WANDB_KEY
+            - name: OOM_FALLBACK
+              value: "0"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              TAG=fastwam-droid-wan22-5b-b128-200k-4gpu
+              mkdir -p /data/huiwon/logs/gr00t-vdm /data/huiwon/tmp
+              L=/data/huiwon/logs/gr00t-vdm/$TAG-$(date +%Y%m%d_%H%M%S)
+              exec > >(tee -a "$L.out") 2> >(tee -a "$L.err" >&2)
+              export FASTWAM_LOG_PREFIX="$L" TAG
+              echo "[$TAG] START $(date -u +%FT%TZ) pod=$HOSTNAME node=${NODE_NAME:-?} job-class=background"
+              rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/*nvidia*.list 2>/dev/null || true
+              APT_OK=0
+              for i in 1 2 3; do apt-get update -qq && apt-get install -y ffmpeg iproute2 libibverbs-dev ibverbs-utils && { APT_OK=1; break; }; echo "apt retry $i"; sleep 15; done
+              [ "$APT_OK" = 1 ] || { echo "FATAL apt/ffmpeg (torchcodec needs the ffmpeg shared libs)"; exit 1; }
+              export TMPDIR=/data/huiwon/tmp
+              # ── preflight gates (the launcher re-checks all of these in more depth) ──
+              export BASE_DIR=/data/huiwon/fastwam
+              cd "$BASE_DIR" || { echo "FATAL no clone $BASE_DIR"; exit 1; }
+              echo "[$TAG] branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit) HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+              test -x .venv/bin/python || { echo "FATAL no venv $BASE_DIR/.venv (build it on the debug pod: bash run_scripts/install_venv.sh)"; exit 1; }
+              .venv/bin/python -c "import fastwam" || { echo "FATAL import fastwam"; exit 1; }
+              for f in configs/task/droid_fastwam_5b_b128_200k.yaml configs/data/droid_wan22_5b.yaml configs/model/fastwam_droid.yaml \
+                       run_scripts/train_droid_mlxp.sh scripts/train.py scripts/compose_check.py scripts/compute_dataset_stats.py \
+                       scripts/check_wan22_weights.py scripts/precompute_text_embeds.py scripts/preprocess_action_dit_backbone.py; do
+                test -s "$f" || { echo "FATAL missing $f"; exit 1; }
+              done
+              bash -n run_scripts/train_droid_mlxp.sh || { echo "FATAL launcher syntax"; exit 1; }
+              W=/data/huiwon/checkpoints/fastwam_base/Wan-AI/Wan2.2-TI2V-5B
+              for f in "$W/diffusion_pytorch_model-00001-of-00003.safetensors" "$W/diffusion_pytorch_model-00002-of-00003.safetensors" \
+                       "$W/diffusion_pytorch_model-00003-of-00003.safetensors" "$W/Wan2.2_VAE.pth" "$W/models_t5_umt5-xxl-enc-bf16.pth" \
+                       /data/huiwon/checkpoints/fastwam_base/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json; do
+                test -s "$f" || { echo "FATAL missing/empty weight $f"; exit 1; }
+              done
+              D=/data/shared_dataset/DreamZero-DROID-Data
+              test -s "$D/meta/info.json" && test -d "$D/videos" && test -d "$D/data" || { echo "FATAL dataset root unreadable $D"; exit 1; }
+              : "${MODEL_OUTPUT_DIR:?spec.env MODEL_OUTPUT_DIR literal required (MLXP enforcement)}"
+              mkdir -p "$MODEL_OUTPUT_DIR"
+              # ══ plate: 4 gpu x pd32 x GA1 = 128, 200K steps, save/1000 keep 5 (all defaults of the launcher) ═══
+              export NUM_GPUS=4 EXPECT_EFF=128 MAX_STEPS=200000 SAVE_EVERY=1000 SAVE_LIMIT=5 NW=12
+              export WANDB_ENTITY=huiwoen0516 WANDB_MODE=online
+              echo "[$TAG] launching: FastWAM(first-frame) x DROID, Wan2.2-TI2V-5B, b128 (pd32 x 4gpu x GA1), 200k, save/1000 keep 5, OOM_FALLBACK=${OOM_FALLBACK:-0} -> $MODEL_OUTPUT_DIR"
+              bash run_scripts/train_droid_mlxp.sh
+              RC=$?; echo "[$TAG] rc=$RC $(date -u +%FT%TZ)"; exit $RC
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"

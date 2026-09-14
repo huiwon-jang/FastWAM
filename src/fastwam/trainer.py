@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -41,6 +42,8 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        save_total_limit = cfg.get("save_total_limit", None)
+        self.save_total_limit = int(save_total_limit) if save_total_limit is not None else None
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -618,8 +621,43 @@ class Wan22Trainer:
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
         self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self._prune_old_checkpoints()
+        self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _prune_old_checkpoints(self):
+        """Keep only the newest `save_total_limit` COMPLETE checkpoints (state dir + weights .pt).
+
+        A state dir is complete iff it holds `trainer_state.json` (written last by `save_checkpoint`).
+        Incomplete dirs older than the newest complete one are leftovers of a killed save and are removed
+        too. No-op when `save_total_limit` is unset or <= 0.
+        """
+        if not self.save_total_limit or self.save_total_limit <= 0:
+            return
+        pattern = re.compile(r"^step_(\d+)$")
+        complete, incomplete = [], []
+        for name in os.listdir(self.state_dir):
+            match = pattern.match(name)
+            if not match or not os.path.isdir(os.path.join(self.state_dir, name)):
+                continue
+            step = int(match.group(1))
+            if os.path.isfile(os.path.join(self.state_dir, name, "trainer_state.json")):
+                complete.append((step, name))
+            else:
+                incomplete.append((step, name))
+        complete.sort()
+        to_remove = complete[: max(len(complete) - self.save_total_limit, 0)]
+        newest_complete = complete[-1][0] if complete else -1
+        to_remove += [(s, n) for s, n in incomplete if s < newest_complete]
+        for step, name in to_remove:
+            state_path = os.path.join(self.state_dir, name)
+            weights_path = os.path.join(self.weights_dir, f"{name}.pt")
+            shutil.rmtree(state_path, ignore_errors=True)
+            if os.path.isfile(weights_path):
+                os.remove(weights_path)
+            logger.info("[ckpt] pruned old checkpoint step=%d (%s, %s)", step, state_path, weights_path)
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)

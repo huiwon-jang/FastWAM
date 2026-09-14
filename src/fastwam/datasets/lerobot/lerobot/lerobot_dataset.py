@@ -114,6 +114,15 @@ class LeRobotDatasetMetadata:
         self.episodes = load_episodes(self.root)
         if self._version < packaging.version.parse("v2.1"):
             self.stats = load_stats(self.root)
+            # LeRobot v2.0 `meta/stats.json` has no per-feature `count` (introduced in v2.1), but
+            # MultiLeRobotDataset.__init__ aggregates metadata stats with the v2.1 algorithm
+            # (compute_stats.aggregate_feature_stats needs `count` of shape (1,)). Add the dataset-wide
+            # frame count so v2.0 datasets (e.g. DreamZero-DROID-Data) load unchanged.
+            if self.stats is not None:
+                count = np.array([int(self.info["total_frames"])])
+                for feature_stats in self.stats.values():
+                    if isinstance(feature_stats, dict) and "count" not in feature_stats:
+                        feature_stats["count"] = count.copy()
             self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
         else:
             self.episodes_stats = load_episodes_stats(self.root)

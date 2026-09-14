@@ -20,6 +20,7 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+save_total_limit: null # keep only the newest N complete checkpoints (weights .pt + state dir); null = keep all
 eval_every: 50
 eval_num_inference_steps: 10
 

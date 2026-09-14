@@ -43,8 +43,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
+        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", "tmosaic", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        tmosaic_top_size=(192, 320), # "tmosaic": cam[0] resized to this on top ...
+        tmosaic_bottom_size=(96, 160), # ... cam[1] | cam[2] resized to this, side by side, below
         tolerance_s: Optional[float] = None,
         video_backend: Optional[str] = None,
     ):
@@ -81,6 +83,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.tmosaic_top_size = [int(v) for v in tmosaic_top_size]
+        self.tmosaic_bottom_size = [int(v) for v in tmosaic_bottom_size]
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -190,6 +194,28 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )  # [T_video, C, 128, 160]
             bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
             video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+        elif self.concat_multi_camera == "tmosaic":
+            # Our WAM "tmosaic" DROID layout: one big view on top, two small views side by side below
+            # (default 192x320 over 96x160|96x160 -> 288x320; ~aspect-preserving for 180x320 DROID frames).
+            if num_cameras != 3:
+                raise ValueError(
+                    f"`concat_multi_camera='tmosaic'` requires exactly 3 cameras, got {num_cameras}"
+                )
+            th, tw = self.tmosaic_top_size
+            bh, bw = self.tmosaic_bottom_size
+            if 2 * bw != tw:
+                raise ValueError(f"tmosaic: 2 * bottom width ({bw}) must equal top width ({tw})")
+            cam_top = transforms_F.resize(
+                video[0], size=[th, tw], interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True
+            )  # [T_video, C, th, tw]
+            cam_left = transforms_F.resize(
+                video[1], size=[bh, bw], interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True
+            )
+            cam_right = transforms_F.resize(
+                video[2], size=[bh, bw], interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True
+            )
+            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, bh, 2*bw]
+            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, th+bh, tw]
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
@@ -198,7 +224,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical, robotwin."
+                    "Expected one of: horizontal, vertical, robotwin, tmosaic."
                 )
         else:
             video = video.squeeze(0)  # [T_video, C, H, W]

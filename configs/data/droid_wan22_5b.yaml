@@ -1,0 +1,73 @@
+# DreamZero-DROID-Data (LeRobot v2.0, 57,774 episodes / 14.7M frames @ 15 Hz, 3 cams 180x320) for FastWAM.
+# Loads AS-IS through FastWAM's vendored LeRobot v2.x loader (codebase_version v2.0 -> meta/stats.json path);
+# no conversion. Recipe target = our WAM DROID "str3h24" runs:
+#   * window: num_frames=25 observations (t0..t24) -> 24 actions @15 Hz (1.6 s), video frames every 3rd
+#     obs -> [0,3,...,24] = 9 frames = 1 + 8 (Wan2.2 VAE temporal 4 -> 3 latent frames), 3 actions / transition
+#   * views: "tmosaic" = wrist 192x320 on top, exterior_1 | exterior_2 96x160 below -> 288x320 canvas
+#     (latent 18x20 -> 9x10 = 90 tokens/frame), ~aspect-preserving for the 180x320 source
+#   * action = relative joint_position(7) + absolute gripper_position(1); state = joint(7)+gripper(1)
+#   * normalization q01/q99 (FastWAM's own stats tool, computed post-transform), see scripts/compute_dataset_stats.py
+train:
+  _target_: fastwam.datasets.lerobot.droid_dataset.DroidRobotVideoDataset
+  dataset_dirs:
+    - ${oc.env:DROID_DATA_ROOT,/data/shared_dataset/DreamZero-DROID-Data}
+  shape_meta:
+    images:
+      - key: wrist_image_left          # -> observation.images.wrist_image_left  (tmosaic TOP, 192x320)
+        raw_shape: [3, 180, 320]
+        shape: [3, 180, 320]
+      - key: exterior_image_1_left     # -> observation.images.exterior_image_1_left (bottom-left, 96x160)
+        raw_shape: [3, 180, 320]
+        shape: [3, 180, 320]
+      - key: exterior_image_2_left     # -> observation.images.exterior_image_2_left (bottom-right, 96x160)
+        raw_shape: [3, 180, 320]
+        shape: [3, 180, 320]
+    action:
+      - key: default                   # -> "action" column, 28-dim raw
+        raw_shape: 28                  # before DroidJointGripperTransform
+        shape: 8                       # after: rel joint(7) + gripper(1)
+    state:
+      - key: default                   # -> "observation.state" column, 14-dim raw
+        raw_shape: 14
+        shape: 8                       # joint(7) + gripper(1)
+  num_frames: 25
+  global_sample_stride: 1
+  action_video_freq_ratio: 3           # 24 actions, 9 video frames
+  video_size: [288, 320]               # final canvas (H, W); multiples of 16 (VAE) and 32 (patch 2)
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  pretrained_norm_stats: ${oc.env:FASTWAM_DROID_STATS,null}   # launcher exports the precomputed stats json
+  skip_padding_as_possible: false
+  concat_multi_camera: "tmosaic"
+  tmosaic_top_size: [192, 320]
+  tmosaic_bottom_size: [96, 160]
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 8
+    proprio_output_dim: 8
+    # NOTE: FastWAM's delta_action_dim_mask is applied to the RAW (28-dim) action before the transform, so it
+    # cannot be used when raw_shape != shape. DroidJointGripperTransform zeroes padded relative-joint steps itself.
+    delta_action_dim_mask: null
+    action_state_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.droid.DroidJointGripperTransform
+        keys: [default]
+        relative_joint: true
+        zero_padded_relative: true
+    use_stepwise_action_norm: false
+    norm_default_mode: q01/q99
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    # keep the native 180x320 frames here; the tmosaic layout does the per-cell resize on the 9 sampled frames
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+  text_embedding_cache_dir: ${oc.env:FASTWAM_DROID_TEXT_CACHE,/data/huiwon/data/droid_fastwam/text_embeds_cache}
+  use_text_embed_cache: true
+  context_len: 128
+  video_backend: ${oc.env:FASTWAM_VIDEO_BACKEND,torchcodec}

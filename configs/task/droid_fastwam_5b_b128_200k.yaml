@@ -1,0 +1,43 @@
+# @package _global_
+# FastWAM (uncond = first-frame Fast-WAM) x DROID, Wan2.2-TI2V-5B, effective batch 128 on 4 GPUs, 200K steps.
+#   effective batch = batch_size (per device) x num_processes x gradient_accumulation_steps = 32 x 4 x 1
+#   (run_scripts/train_droid_mlxp.sh overrides batch_size / GA / grad-ckpt for OOM_FALLBACK levels)
+#   LR 1e-4, wd 1e-2, cosine to 1% of LR (trainer hard-codes eta_min = 0.01*lr, warmup = 5% of max_steps),
+#   AdamW betas (0.9, 0.95), grad clip 1.0, bf16, seed 42.
+#   Checkpoint every 1000 optimizer steps, keep the newest 5 (weights .pt + accelerate/DeepSpeed state dir).
+#   Eval disabled (eval_every: 0). wandb project "fastwam".
+
+defaults:
+  - override /data: droid_wan22_5b
+  - override /model: fastwam_droid
+  - _self_
+
+# dataloading
+batch_size: 32
+num_workers: 12
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 1
+max_steps: 200000
+log_every: 10
+save_every: 1000
+save_total_limit: 5
+eval_every: 0
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+wandb:
+  enabled: true
+  workspace: null          # entity comes from $WANDB_ENTITY
+  project: fastwam
+  name: fastwam_droid_wan22_5b_b128_200k_4gpu
+  group: null
+  mode: online
