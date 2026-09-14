@@ -37,7 +37,10 @@ train:
   camera_key: null
   val_set_proportion: 0.0
   is_training_set: true
-  pretrained_norm_stats: ${oc.env:FASTWAM_DROID_STATS,null}   # launcher exports the precomputed stats json
+  # launcher exports FASTWAM_DROID_STATS=/data/huiwon/data/droid_fastwam/dataset_stats.true_global.json (TRUE global
+  # q01/q99, huiwon override + marker). NEVER point this at FastWAM's native dataset_stats.json: its "q01/q99" are
+  # per-episode quantiles amin/amax-reduced over episodes (~global min/max) and squeeze the relative joint range.
+  pretrained_norm_stats: ${oc.env:FASTWAM_DROID_STATS,null}
   skip_padding_as_possible: false
   concat_multi_camera: "tmosaic"
   tmosaic_top_size: [192, 320]

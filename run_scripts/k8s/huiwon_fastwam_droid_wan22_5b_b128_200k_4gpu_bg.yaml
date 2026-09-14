@@ -22,7 +22,12 @@
 #              Wan2.2-TI2V-5B (DiT 3 shards + Wan2.2_VAE.pth + models_t5_umt5-xxl-enc-bf16.pth), tokenizer symlink
 #              Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl -> Wan2.2-TI2V-5B/google/umt5-xxl. No downloads (DIFFSYNTH_SKIP_DOWNLOAD).
 #   data     : /data/shared_dataset/DreamZero-DROID-Data read-only (LeRobot v2.0, loads as-is). Derived artifacts go to
-#              /data/huiwon/data/droid_fastwam/{dataset_stats.json,text_embeds_cache/} and the ActionDiT .pt next to the weights.
+#              /data/huiwon/data/droid_fastwam/{dataset_stats.json,true_global_quantiles.json,dataset_stats.true_global.json,
+#              text_embeds_cache/} and the ActionDiT .pt next to the weights.
+#   stats    : normalization = TRUE global q01/q99 (huiwon override, dataset_stats.true_global.json, marker
+#              "huiwon_true_global_quantiles": true — the launcher refuses anything else). FastWAM's own stats tool takes
+#              per-episode quantiles and amin/amax-reduces them over 57k episodes, i.e. ~min/max -> squeezed relative
+#              joint deltas; dataset_stats.json (native) is kept for reference only.
 #   ckpt     : $MODEL_OUTPUT_DIR/fastwam_droid_wan22_5b_b128_200k_4gpu/checkpoints/{weights/step_N.pt,state/step_N/}
 #   resume   : automatic (launcher picks the newest complete state/step_* and passes resume=<dir>)
 #   logs     : /data/huiwon/logs/gr00t-vdm/fastwam-droid-wan22-5b-b128-200k-4gpu-<ts>.{out,err}

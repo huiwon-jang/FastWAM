@@ -13,7 +13,11 @@
 #   resume   : automatic — newest state/step_* dir that contains trainer_state.json -> `resume=<dir>`
 #              (accelerate.load_state: DiT + ZeRO-1 optimizer + LR sched; trainer_state.json: step/epoch/
 #              batch_in_epoch -> ResumableEpochSampler offset). Nothing to pass by hand.
-#   one-time : (a) ActionDiT backbone .pt (GPU, ~min)  (b) dataset_stats.json (CPU parquet pass)
+#   one-time : (a) ActionDiT backbone .pt (GPU, ~min)  (b) FastWAM-native dataset_stats.json (CPU parquet pass)
+#              (b2) true_global_quantiles.json (CPU; scripts/compute_true_global_quantiles.py — FastWAM's tool
+#              takes per-episode quantiles and amin/amax-reduces them, which collapses q01/q99 to ~min/max over
+#              57k episodes)  (b3) dataset_stats.true_global.json = native schema + TRUE global q01/q99 +
+#              marker "huiwon_true_global_quantiles": true — the ONLY stats file training is allowed to use
 #              (c) umT5 text-embedding cache for every tasks.jsonl row (torchrun, all GPUs)
 #              — each runs only when its output is missing.
 #   logs     : /data/huiwon/logs/gr00t-vdm/<TAG>-<ts>.{out,err} (or the caller's $FASTWAM_LOG_PREFIX)
@@ -94,7 +98,9 @@ export FASTWAM_ACTION_DIT_PT="$CKPT_BASE/ActionDiT_linear_interp_Wan22_alphascal
 export DROID_DATA_ROOT="${DROID_DATA_ROOT:-/data/shared_dataset/DreamZero-DROID-Data}"
 export FASTWAM_DROID_TEXT_CACHE="$PREP_DIR/text_embeds_cache"
 export FASTWAM_VIDEO_BACKEND="${FASTWAM_VIDEO_BACKEND:-torchcodec}"
-STATS_JSON="$PREP_DIR/dataset_stats.json"
+STATS_NATIVE="$PREP_DIR/dataset_stats.json"                   # FastWAM's own tool (kept for reference only)
+TRUEQ_JSON="$PREP_DIR/true_global_quantiles.json"             # pooled numpy.percentile over training-sample values
+STATS_JSON="$PREP_DIR/dataset_stats.true_global.json"         # <- what training reads (native schema + true q01/q99 + marker)
 export HF_HOME=/data/huiwon/.cache/huggingface HF_HUB_OFFLINE=1 HF_DATASETS_CACHE=/data/huiwon/.cache/hf_datasets_fastwam
 export TMPDIR=/data/huiwon/tmp
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MALLOC_ARENA_MAX=2 TOKENIZERS_PARALLELISM=false
@@ -136,12 +142,29 @@ if [ ! -s "$FASTWAM_ACTION_DIT_PT" ]; then
 else
   echo "[$TAG] prep(a): ActionDiT backbone present ($(du -h "$FASTWAM_ACTION_DIT_PT" | cut -f1))"
 fi
-if [ ! -s "$STATS_JSON" ]; then
-  echo "[$TAG] prep(b): dataset_stats.json (CPU pass over all parquet episodes, post-transform q01/q99) -> $STATS_JSON"
+if [ ! -s "$STATS_NATIVE" ]; then
+  echo "[$TAG] prep(b): FastWAM-native dataset_stats.json (CPU pass over all parquet episodes) -> $STATS_NATIVE"
   env -u FASTWAM_DROID_STATS python scripts/compute_dataset_stats.py task="$TASK" +stats_output_dir="$PREP_DIR" || fatal "dataset stats"
 else
-  echo "[$TAG] prep(b): dataset stats present: $STATS_JSON"
+  echo "[$TAG] prep(b): native dataset stats present: $STATS_NATIVE"
 fi
+if [ ! -s "$TRUEQ_JSON" ]; then
+  echo "[$TAG] prep(b2): true global q01/q99 over pooled training-sample values (CPU, every anchor) -> $TRUEQ_JSON"
+  python scripts/compute_true_global_quantiles.py --dataset-root "$DROID_DATA_ROOT" --out "$TRUEQ_JSON" \
+    --staging-dir "$TMPDIR/fastwam_trueq_$$" --anchor-stride 1 --workers 16 || fatal "true global quantiles"
+else
+  echo "[$TAG] prep(b2): true global quantiles present: $TRUEQ_JSON"
+fi
+if [ ! -s "$STATS_JSON" ]; then
+  echo "[$TAG] prep(b3): dataset_stats.true_global.json (native schema + true q01/q99 + marker) -> $STATS_JSON"
+  python scripts/apply_true_global_quantiles.py --native "$STATS_NATIVE" --true "$TRUEQ_JSON" --out "$STATS_JSON" || fatal "apply true global quantiles"
+else
+  echo "[$TAG] prep(b3): override stats present: $STATS_JSON"
+fi
+# gate: training must never run on FastWAM-native (collapsed) quantiles, whatever regenerated the file
+python -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('huiwon_true_global_quantiles') is True else 1)" "$STATS_JSON" \
+  || fatal "$STATS_JSON lacks the marker huiwon_true_global_quantiles=true (FastWAM-native stats would compress the action range); rebuild with scripts/apply_true_global_quantiles.py"
+echo "[$TAG] stats: TRUE global q01/q99 (huiwon override) from $STATS_JSON"
 export FASTWAM_DROID_STATS="$STATS_JSON"
 TXT_DONE="$FASTWAM_DROID_TEXT_CACHE/.precompute_done"
 if [ ! -f "$TXT_DONE" ]; then
@@ -180,7 +203,7 @@ if [ -n "$RESUME_DIR" ]; then
   RESUME_ARGS=("resume=$RESUME_DIR")
 fi
 
-echo "[$TAG] BANNER oom_level=L$OOM_LEVEL eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} | grad_ckpt=$GC | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
+echo "[$TAG] BANNER oom_level=L$OOM_LEVEL eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} | grad_ckpt=$GC | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | stats=true-global-q01q99(huiwon override) | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
 
 # ── train (mirrors scripts/train_zero1.sh, but with a FIXED output_dir so resume is possible) ────────
 accelerate launch \
