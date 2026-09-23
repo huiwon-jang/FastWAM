@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
-from .utils.samplers import ResumableEpochSampler
+from .utils.samplers import BalancedGroupEpochSampler, ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -99,7 +99,16 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
-        warmup_steps = int(total_train_steps * 0.05)
+        cfg_warmup = cfg.get("warmup_steps", None)
+        warmup_steps = int(total_train_steps * 0.05) if cfg_warmup is None else int(cfg_warmup)
+        cfg_min_lr_ratio = cfg.get("min_lr_ratio", None)
+        self.min_lr_ratio = 0.01 if cfg_min_lr_ratio is None else float(cfg_min_lr_ratio)
+        logger.info(
+            "LR schedule: type=%s lr=%.3e warmup_steps=%d (%s) min_lr_ratio=%.3f (%s) total_steps=%d",
+            cfg.lr_scheduler_type, self.learning_rate, warmup_steps, "config" if cfg_warmup is not None else "default 5%",
+            self.min_lr_ratio, "config" if cfg_min_lr_ratio is not None else "default", total_train_steps,
+        )
+        self.warmup_steps = warmup_steps
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
             total_train_steps=total_train_steps,
@@ -191,12 +200,28 @@ class Wan22Trainer:
         self.wandb_run = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
-        self.train_sampler = ResumableEpochSampler(
-            dataset=dataset,
-            seed=self.seed,
-            batch_size=self.batch_size,
-            num_processes=self.accelerator.num_processes,
-        )
+        group_ids = getattr(dataset, "batch_group_ids", None)
+        if group_ids is not None:
+            # dataset asks for an exact per-batch group mix (e.g. OpenArm robot/human 0.5/0.5)
+            self.train_sampler = BalancedGroupEpochSampler(
+                dataset=dataset,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+                group_ids=group_ids,
+                group_fractions=getattr(dataset, "batch_group_fractions"),
+            )
+            logger.info(
+                "Balanced batch sampler: groups=%s per_batch=%s batches/epoch=%d (batch_size=%d)",
+                self.train_sampler.groups, self.train_sampler.per_batch, self.train_sampler.num_batches, self.batch_size,
+            )
+        else:
+            self.train_sampler = ResumableEpochSampler(
+                dataset=dataset,
+                seed=self.seed,
+                batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes,
+            )
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -253,7 +278,7 @@ class Wan22Trainer:
             main_scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=remaining_steps,
-                eta_min=self.learning_rate * 0.01,
+                eta_min=self.learning_rate * getattr(self, "min_lr_ratio", 0.01),
             )
         elif scheduler_type == "constant":
             main_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=remaining_steps)

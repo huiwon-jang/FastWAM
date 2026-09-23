@@ -1,0 +1,47 @@
+# @package _global_
+# FastWAM (uncond = first-frame Fast-WAM) x openarm_wam_v1 robot+human (rh11), Wan2.2-TI2V-5B, effective batch 64 on
+# 4 GPUs (= 32 robot + 32 human per step, exact 8+8 per GPU at pd16), 50K steps.
+#   effective batch = batch_size (per device) x num_processes x gradient_accumulation_steps = 16 x 4 x 1
+#   (run_scripts/train_openarm_mlxp.sh overrides batch_size / GA / grad-ckpt for OOM levels: L0 pd16, L1 +GC,
+#    L2 pd8xGA2, L3 pd4xGA4 — every plate keeps an even per-device batch so the robot/human halves stay exact)
+#   LR 1e-4 (user 2026-09-23; the DROID task also used 1e-4), wd 1e-2, warmup 2500 steps (explicit `warmup_steps`;
+#   the DROID run used the trainer's hard-coded 5% of max_steps = 10000), cosine to 0.1 x LR (`min_lr_ratio: 0.1`;
+#   DROID: hard-coded 0.01), AdamW betas (0.9, 0.95), grad clip 1.0, bf16, seed 42.
+#   Checkpoint every 1000 optimizer steps, keep the newest 5. Eval disabled. wandb project "fastwam".
+
+defaults:
+  - override /data: openarm_wan22_5b
+  - override /model: fastwam_droid     # same 5B video expert / ActionDiT / schedulers / loss as the DROID port; action_dim follows the processor (28)
+  - _self_
+
+# dataloading
+batch_size: 16
+num_workers: 12
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+warmup_steps: 2500        # unification spec (our OpenArm WAM runs); null would mean the trainer default 5% of max_steps
+min_lr_ratio: 0.1         # cosine floor = 0.1 x LR (our real-robot WAM convention); null = trainer default 0.01
+num_epochs: 1
+max_steps: 50000
+log_every: 10
+save_every: 1000
+save_total_limit: 5
+eval_every: 0
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+wandb:
+  enabled: true
+  workspace: null          # entity comes from $WANDB_ENTITY
+  project: fastwam
+  name: fastwam_openarm_wam_v1human_rh11_b64_50k_4gpu
+  group: null
+  mode: online

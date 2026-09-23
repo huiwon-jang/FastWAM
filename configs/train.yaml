@@ -16,6 +16,8 @@ num_workers: 4
 # scheduler
 lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
+warmup_steps: null      # linear warmup steps; null = 5% of the total steps (legacy hard-coded behaviour)
+min_lr_ratio: null      # cosine floor as a fraction of learning_rate; null = 0.01 (legacy hard-coded behaviour)
 num_epochs: 1
 max_steps: null
 log_every: 10

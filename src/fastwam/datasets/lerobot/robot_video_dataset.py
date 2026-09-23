@@ -61,6 +61,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             image_subsample_stride=action_video_freq_ratio,
             tolerance_s=tolerance_s,
             video_backend=video_backend,
+            **self._base_dataset_extra_kwargs(),
         )
     
         self.num_frames = num_frames
@@ -124,10 +125,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
         
+    def _base_dataset_extra_kwargs(self):
+        """Extra kwargs for `base_dataset_cls` (subclass hook; the generic dataset takes none)."""
+        return {}
+
     def __len__(self):
         return len(self.lerobot_dataset)
 
     def _get(self, idx):
+        return self._build_data(self._fetch_sample(idx))
+
+    def _fetch_sample(self, idx):
         sample_idx = idx
         sample = None
         for attempt in range(self.max_padding_retry + 1):
@@ -151,7 +159,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
-        
+        return sample
+
+    def _build_data(self, sample):
+        """Processed lerobot sample -> training dict (video canvas, action/proprio, prompt, text context)."""
         image_is_pad = sample["image_is_pad"]
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]

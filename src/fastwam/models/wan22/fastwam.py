@@ -324,6 +324,20 @@ class FastWAM(torch.nn.Module):
                     f"got {tuple(action_is_pad.shape)} vs expected ({batch_size}, {action_horizon})"
                 )
 
+        # optional per-sample / per-dim action-loss masks (OpenArm robot+human co-training):
+        #   has_action [B] bool      : False -> the sample contributes nothing to the action loss (human clips)
+        #   action_dim_mask [B, D]   : False -> that action dim is excluded from the per-token MSE (absent groups)
+        has_action = sample.get("has_action", None)
+        if has_action is not None:
+            if has_action.ndim != 1 or has_action.shape[0] != batch_size:
+                raise ValueError(f"`sample['has_action']` must be 1D [B], got {tuple(has_action.shape)}")
+        action_dim_mask = sample.get("action_dim_mask", None)
+        if action_dim_mask is not None:
+            if action_dim_mask.ndim != 2 or action_dim_mask.shape[0] != batch_size or action_dim_mask.shape[1] != action.shape[2]:
+                raise ValueError(
+                    f"`sample['action_dim_mask']` must be [B, action_dim]={(batch_size, action.shape[2])}, got {tuple(action_dim_mask.shape)}"
+                )
+
         image_is_pad = sample.get("image_is_pad", None)
         if image_is_pad is not None:
             if image_is_pad.ndim != 2:
@@ -381,6 +395,10 @@ class FastWAM(torch.nn.Module):
             action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if has_action is not None:
+            has_action = has_action.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if action_dim_mask is not None:
+            action_dim_mask = action_dim_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
         return {
             "context": context,
@@ -391,6 +409,8 @@ class FastWAM(torch.nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
+            "has_action": has_action,
+            "action_dim_mask": action_dim_mask,
         }
 
     @torch.no_grad()
@@ -587,7 +607,14 @@ class FastWAM(torch.nn.Module):
         )
         loss_video = (loss_video_per_sample * video_weight).mean()
 
-        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        action_mse = F.mse_loss(pred_action.float(), target_action.float(), reduction="none")  # [B, T, D]
+        action_dim_mask = inputs.get("action_dim_mask", None)
+        if action_dim_mask is not None:
+            # per-dim mask: absent action groups (zero-filled) are excluded from the token MSE
+            dim_valid = action_dim_mask.to(dtype=action_mse.dtype).unsqueeze(1)  # [B, 1, D]
+            action_loss_token = (action_mse * dim_valid).sum(dim=2) / dim_valid.sum(dim=2).clamp(min=1.0)  # [B, T]
+        else:
+            action_loss_token = action_mse.mean(dim=2)  # [B, T]
         if action_is_pad is not None:
             valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
             valid_sum = valid.sum(dim=1).clamp(min=1.0)
@@ -598,13 +625,22 @@ class FastWAM(torch.nn.Module):
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
         )
-        loss_action = (action_loss_per_sample * action_weight).mean()
+        has_action = inputs.get("has_action", None)
+        if has_action is not None:
+            # per-sample mask: video-only samples (human clips) contribute NOTHING to the action loss; the loss is
+            # averaged over the real-action samples so its per-sample scale is the same as an all-robot batch
+            row_valid = has_action.to(device=action_loss_per_sample.device, dtype=action_loss_per_sample.dtype)
+            loss_action = (action_loss_per_sample * action_weight * row_valid).sum() / row_valid.sum().clamp(min=1.0)
+        else:
+            loss_action = (action_loss_per_sample * action_weight).mean()
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if has_action is not None:
+            loss_dict["action_rows"] = float(has_action.sum().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
