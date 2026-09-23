@@ -1,0 +1,196 @@
+# ==============================================================================================================
+# FastWAM x openarm_wam_v1 robot+human (rh11) — Wan2.2-TI2V-5B "first-frame" Fast-WAM (uncond) — MLXP single node,
+# 4x H200, eff. batch 64 (= 32 robot + 32 human, exact 8+8 per GPU), 50K steps — NORMAL-class Job, backoffLimit 50.
+# --------------------------------------------------------------------------------------------------------------
+#   repo     : /data/huiwon/fastwam-openarm = git WORKTREE of /data/huiwon/fastwam, branch huiwon/openarm-mlxp
+#              (HEAD gate below = dab150716c45e2124e0fa7d05ec4738f9ed68a13; pushed to github.com/huiwon-jang/FastWAM). Own .venv (built fresh with
+#              run_scripts/install_venv.sh from the DROID venv's freeze: torch 2.7.1+cu128, deepspeed 0.18.7 ZeRO-1,
+#              accelerate 1.12.0, transformers 4.49.0, torchcodec 0.4.0). NEVER a cp -al copy of another venv.
+#   launcher : run_scripts/train_openarm_mlxp.sh (gates + one-time prep + OOM self-escalation + auto-resume)
+#   task     : configs/task/openarm_fastwam_5b_b64_50k.yaml -> data=openarm_wan22_5b, model=fastwam_droid
+#   UNIFICATION with our finished OpenArm WAM runs (asserted by scripts/compose_check.py in the launcher):
+#     canvas 384x256 = vertical concat of 2 x 192x256 (left TOP, right BOTTOM, BLACK for a missing view)
+#     moderate aug (rotate +-5 / random crop 0.9 area / brightness-contrast-saturation x U(0.8,1.2), every view)
+#     video frames [0,3,...,24] (stride 3 at native fps 20/30), action horizon 24 (action[t+j], j=0..23)
+#     arms [2:16] RELATIVE to state[t0] + neck/hands absolute, global q01/q99 over ROBOT frames only
+#     (dataset_stats.true_global.json, marker huiwon_true_global_quantiles; human zeros + banana's absent groups excluded)
+#     LR 1e-4, warmup 2500, cosine to 0.1 x LR, wd 0.01, 50K steps, eff batch 64 = pd16 x 4 gpu x GA1
+#     human rows (5 subsets): video loss only (has_action=False); banana: 15 absent dims masked per-dim
+#   FastWAM defaults kept: ActionDiT 1024/30L (backbone .pt shared with DROID: action_dim-independent), video shift
+#     5.0 / action shift 1.0, betas (0.9,0.95), clip 1.0, ZeRO-1 no offload, lambda_action 1.0, first_frame_causal.
+#   data     : /data/huiwon/data/openarm_wam_v1 (6 robot + 5 human subsets, gated below). Derived artifacts:
+#              /data/huiwon/data/openarm_fastwam/{dataset_stats.true_global.json,true_global_quantiles.json,text_embeds_cache/,oom_level}
+#   ckpt     : $MODEL_OUTPUT_DIR/fastwam_openarm_wam_v1human_rh11_b64_50k_4gpu/checkpoints/{weights/step_N.pt,state/step_N/}
+#              every 1000 keep 5 -> HF uploader /data/huiwon/tmp/hf_upload_fastwam_openarm.py (30K, 50K)
+#   resume   : automatic (newest complete state/step_*; sample-based position, plate-independent)
+#   logs     : /data/huiwon/logs/gr00t-vdm/fastwam-openarm-wam-v1human-rh11-b64-50k-4gpu-<ts>.{out,err}
+#   OOM      : launcher self-escalates L0 pd16 -> L1 +grad-ckpt -> L2 pd8xGA2 -> L3 pd4xGA4 (eff 64 kept); OOM_FALLBACK env = floor.
+#   DROID-run slowness avoided: text cache held in memory (72 prompts), tiny 192x256 mp4s in page cache, no offload, GC off at L0.
+# ==============================================================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: huiwon-fastwam-oav1hum-wan22-5b-b64-50k-4gpu
+  namespace: p-rlwrld
+  labels:
+    mlxp/job-class: normal
+    project-code: sub_wam
+    project-short-name: sub_wam
+spec:
+  backoffLimit: 50
+  ttlSecondsAfterFinished: 300
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  podReplacementPolicy: Failed
+  podFailurePolicy:
+    rules:
+      # evictions / preemptions (node drain, scheduler preemption) are not counted against backoffLimit
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+  template:
+    metadata:
+      annotations:
+        # BOTH zone markers are load-bearing: without the zone annotation the MLXP pod-admission
+        # webhook falls back to zone "test" and denies every pod (FailedCreate loop).
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+      labels:
+        mlxp/job-class: normal
+        project-code: sub_wam
+        project-short-name: sub_wam
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mlx.navercorp.com/hardware-type: gpu
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      # No kubernetes.io/hostname affinity on purpose (MLXP resource convention 2026-09-06).
+      imagePullSecrets:
+        - name: mlxp-registry
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: train
+          image: mlxp.kr.ncr.ntruss.com/taeyoung/groot:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            # MLXP enforcement: MODEL_OUTPUT_DIR MUST be a spec.env literal (a container-side export is
+            # not seen by the scheduler check -> suspend-kill).
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/huiwon/fastwam
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: GLOO_SOCKET_FAMILY
+              value: AF_INET
+            - name: LD_PRELOAD
+              value: /data/libipv4_force_v2.so
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+            - name: WANDB_API_KEY
+              value: REPLACE_WITH_WANDB_KEY
+            - name: OOM_FALLBACK
+              value: "0"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              TAG=fastwam-openarm-wam-v1human-rh11-b64-50k-4gpu
+              mkdir -p /data/huiwon/logs/gr00t-vdm /data/huiwon/tmp
+              L=/data/huiwon/logs/gr00t-vdm/$TAG-$(date +%Y%m%d_%H%M%S)
+              exec > >(tee -a "$L.out") 2> >(tee -a "$L.err" >&2)
+              export FASTWAM_LOG_PREFIX="$L" TAG
+              echo "[$TAG] START $(date -u +%FT%TZ) pod=$HOSTNAME node=${NODE_NAME:-?} job-class=normal"
+              rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/*nvidia*.list 2>/dev/null || true
+              APT_OK=0
+              for i in 1 2 3; do apt-get update -qq && apt-get install -y ffmpeg iproute2 libibverbs-dev ibverbs-utils && { APT_OK=1; break; }; echo "apt retry $i"; sleep 15; done
+              [ "$APT_OK" = 1 ] || { echo "FATAL apt/ffmpeg (torchcodec needs the ffmpeg shared libs)"; exit 1; }
+              export TMPDIR=/data/huiwon/tmp
+              # ── worktree + HEAD gate (the branch is pushed; a different HEAD means the yaml and the code disagree) ──
+              export BASE_DIR=/data/huiwon/fastwam-openarm
+              cd "$BASE_DIR" || { echo "FATAL no clone $BASE_DIR (dedicated node without /data? -> backoffLimit retries)"; exit 1; }
+              HEAD=$(git rev-parse HEAD 2>/dev/null || echo nogit)
+              echo "[$TAG] branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit) HEAD=$HEAD"
+              [ "$(git rev-parse --abbrev-ref HEAD)" = "huiwon/openarm-mlxp" ] || { echo "FATAL worktree branch != huiwon/openarm-mlxp"; exit 1; }
+              case "$HEAD" in REPLACE_WITH_HEAD_SHA*) : ;; *) echo "FATAL HEAD $HEAD != expected REPLACE_WITH_HEAD_SHA"; exit 1;; esac
+              [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "FATAL worktree has uncommitted changes"; git status --short | head; exit 1; }
+              test -x .venv/bin/python || { echo "FATAL no venv $BASE_DIR/.venv (BASE_DIR=$BASE_DIR bash run_scripts/install_venv.sh on the debug pod)"; exit 1; }
+              head -1 .venv/bin/torchrun | grep -q "^#!$BASE_DIR/.venv/bin/python" || { echo "FATAL torchrun shebang not in $BASE_DIR/.venv"; exit 1; }
+              .venv/bin/python -c "import fastwam,os; f=os.path.realpath(fastwam.__file__); assert f.startswith('$BASE_DIR'), f; print('fastwam from', f)" || { echo "FATAL import fastwam from the worktree"; exit 1; }
+              for f in configs/task/openarm_fastwam_5b_b64_50k.yaml configs/data/openarm_wan22_5b.yaml configs/model/fastwam_droid.yaml \
+                       run_scripts/train_openarm_mlxp.sh scripts/train.py scripts/compose_check.py scripts/compute_openarm_true_global_stats.py \
+                       scripts/check_wan22_weights.py scripts/precompute_text_embeds.py scripts/preprocess_action_dit_backbone.py \
+                       src/fastwam/datasets/lerobot/openarm_dataset.py src/fastwam/datasets/lerobot/transforms/openarm.py \
+                       src/fastwam/datasets/lerobot/transforms/openarm_aug.py src/fastwam/datasets/lerobot/processors/openarm_processor.py; do
+                test -s "$f" || { echo "FATAL missing $f"; exit 1; }
+              done
+              bash -n run_scripts/train_openarm_mlxp.sh || { echo "FATAL launcher syntax"; exit 1; }
+              W=/data/huiwon/checkpoints/fastwam_base/Wan-AI/Wan2.2-TI2V-5B
+              for f in "$W/diffusion_pytorch_model-00001-of-00003.safetensors" "$W/diffusion_pytorch_model-00002-of-00003.safetensors" \
+                       "$W/diffusion_pytorch_model-00003-of-00003.safetensors" "$W/Wan2.2_VAE.pth" "$W/models_t5_umt5-xxl-enc-bf16.pth" \
+                       /data/huiwon/checkpoints/fastwam_base/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json \
+                       /data/huiwon/checkpoints/fastwam_base/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt; do
+                test -s "$f" || { echo "FATAL missing/empty weight $f"; exit 1; }
+              done
+              # ── dataset gates: 6 robot + 5 human roots of openarm_wam_v1 (self-contained, no symlinks) ──
+              OA=/data/huiwon/data/openarm_wam_v1
+              ROBOT_SETS="$OA/robot/openarm_ego_jungwook $OA/robot/openarm_teleop_v3/bottle $OA/robot/openarm_teleop_v3/cup $OA/robot/openarm_teleop_v3/doll $OA/robot/openarm_teleop_v3/snack $OA/robot/banana_v21_openarm28"
+              HUMAN_SETS="$OA/human_as_openarm28/rlwrld_human_lerobot $OA/human_as_openarm28/openarm_validation_v2_junhyeong/close_air_fryer $OA/human_as_openarm28/openarm_validation_v2_junhyeong/left_hand_box_white_container $OA/human_as_openarm28/openarm_validation_v2_junhyeong/open_air_fryer $OA/human_as_openarm28/anyh2r"
+              [ "$(echo $ROBOT_SETS | wc -w)" -eq 6 ] && [ "$(echo $HUMAN_SETS | wc -w)" -eq 5 ] || { echo "FATAL need 6 robot + 5 human roots"; exit 1; }
+              test -s "$OA/manifest.json" && test -s "$OA/README.md" || { echo "FATAL $OA is not the self-contained openarm_wam_v1 root"; exit 1; }
+              for d in $ROBOT_SETS $HUMAN_SETS; do
+                for f in meta/info.json meta/tasks.jsonl meta/episodes.jsonl meta/modality.json; do test -s "$d/$f" || { echo "FATAL $d/$f missing"; exit 1; }; done
+                test -d "$d/videos/chunk-000" && test -d "$d/data/chunk-000" || { echo "FATAL $d videos/data missing"; exit 1; }
+                grep -q '"observation.state"' "$d/meta/info.json" && grep -q '"action"' "$d/meta/info.json" || { echo "FATAL $d info.json lacks state/action"; exit 1; }
+              done
+              for d in $ROBOT_SETS; do test -f "$d/meta/wam_human.json" && { echo "FATAL $d is marked human"; exit 1; }; done
+              for d in $HUMAN_SETS; do grep -q '"human": true' "$d/meta/wam_human.json" || { echo "FATAL $d not marked human"; exit 1; }; done
+              _BAN=$OA/robot/banana_v21_openarm28
+              for k in right_arm_joints right_hand_joints; do grep -q "\"$k\"" "$_BAN/meta/wam_action_groups.json" || { echo "FATAL banana action groups"; exit 1; }; done
+              for k in neck_joints left_arm_joints left_hand_joints; do grep -q "\"$k\"" "$_BAN/meta/wam_action_groups.json" && { echo "FATAL banana must NOT declare $k"; exit 1; }; done
+              for d in $ROBOT_SETS; do case "$d" in *banana_v21_openarm28) : ;; *) test -f "$d/meta/wam_action_groups.json" && { echo "FATAL $d must not carry wam_action_groups.json"; exit 1; };; esac; done
+              [ "$(ls $_BAN/videos/chunk-000/observation.image.ego_left/*.mp4 | wc -l)" -eq 54 ] || { echo "FATAL banana ego_left mp4 count != 54"; exit 1; }
+              for v in camera_ego_left camera_ego_right; do [ "$(ls $OA/human_as_openarm28/anyh2r/videos/chunk-000/observation.images.$v/*.mp4 | wc -l)" -eq 510 ] || { echo "FATAL anyh2r $v mp4 count != 510"; exit 1; }; done
+              for d in $OA/human_as_openarm28/rlwrld_human_lerobot $OA/human_as_openarm28/openarm_validation_v2_junhyeong/close_air_fryer $OA/human_as_openarm28/openarm_validation_v2_junhyeong/left_hand_box_white_container $OA/human_as_openarm28/openarm_validation_v2_junhyeong/open_air_fryer; do
+                test -d "$d/videos/chunk-000/observation.images.camera_ego_right" || { echo "FATAL $d lacks the right view"; exit 1; }
+                test -d "$d/videos/chunk-000/observation.images.camera_ego_left" && { echo "FATAL $d unexpectedly has a left view (black-fill assumption)"; exit 1; }
+              done
+              [ "$(find $OA -type l | wc -l)" -eq 0 ] || { echo "FATAL symlinks in $OA"; exit 1; }
+              # ── stats marker gate: if the stats file exists it MUST be the robot-only true-global override ──
+              SJ=/data/huiwon/data/openarm_fastwam/dataset_stats.true_global.json
+              if [ -s "$SJ" ]; then
+                python3 -c "import json,sys; d=json.load(open(sys.argv[1])); m=d.get('huiwon_true_global_quantiles_meta',{}); sys.exit(0 if d.get('huiwon_true_global_quantiles') is True and len(d['action']['default']['global_q01'])==28 and len(m.get('skipped_human_roots',[]))==5 and len(m.get('roots',[]))==6 else 1)" "$SJ" \
+                  || { echo "FATAL $SJ is not the robot-only true-global stats (marker/28 dims/6 robot+5 human meta)"; exit 1; }
+                echo "[$TAG] stats gate OK: $SJ"
+              else
+                echo "[$TAG] stats file absent -> the launcher builds it (robot-only, marker) before training"
+              fi
+              : "${MODEL_OUTPUT_DIR:?spec.env MODEL_OUTPUT_DIR literal required (MLXP enforcement)}"
+              mkdir -p "$MODEL_OUTPUT_DIR"
+              # ══ plate: 4 gpu x pd16 x GA1 = 64 (8 robot + 8 human per GPU), 50K steps, save/1000 keep 5 ═══
+              export NUM_GPUS=4 EXPECT_EFF=64 MAX_STEPS=50000 SAVE_EVERY=1000 SAVE_LIMIT=5 NW=12
+              export WANDB_ENTITY=huiwoen0516 WANDB_MODE=online
+              echo "[$TAG] launching: FastWAM(first-frame) x openarm_wam_v1 rh11, Wan2.2-TI2V-5B, b64 (pd16 x 4gpu x GA1; 32 robot + 32 human), 50k, lr 1e-4 warmup 2500 min-lr 0.1, save/1000 keep 5, OOM_FALLBACK=${OOM_FALLBACK:-0} -> $MODEL_OUTPUT_DIR"
+              bash run_scripts/train_openarm_mlxp.sh
+              RC=$?; echo "[$TAG] rc=$RC $(date -u +%FT%TZ)"; exit $RC
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"
