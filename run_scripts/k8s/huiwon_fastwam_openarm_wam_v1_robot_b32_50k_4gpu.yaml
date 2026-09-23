@@ -135,7 +135,8 @@ spec:
               OA=/data/huiwon/data/openarm_wam_v1
               ROBOT_SETS="$OA/robot/openarm_ego_jungwook $OA/robot/openarm_teleop_v3/bottle $OA/robot/openarm_teleop_v3/cup $OA/robot/openarm_teleop_v3/doll $OA/robot/openarm_teleop_v3/snack $OA/robot/banana_v21_openarm28"
               [ "$(echo $ROBOT_SETS | wc -w)" -eq 6 ] || { echo "FATAL need 6 robot roots"; exit 1; }
-              grep -q human_as_openarm28 "$BASE_DIR/configs/data/openarm_robot_wan22_5b.yaml" && { echo "FATAL robot-only data config references human subsets"; exit 1; }
+              grep -v '^[[:space:]]*#' "$BASE_DIR/configs/data/openarm_robot_wan22_5b.yaml" | grep -q human_as_openarm28 && { echo "FATAL robot-only data config references human subsets (non-comment line)"; exit 1; }
+              [ "$(grep -v '^[[:space:]]*#' "$BASE_DIR/configs/data/openarm_robot_wan22_5b.yaml" | grep -c '/robot/')" -eq 6 ] || { echo "FATAL robot-only data config must list exactly 6 robot roots"; exit 1; }
               test -s "$OA/manifest.json" && test -s "$OA/README.md" || { echo "FATAL $OA is not the self-contained openarm_wam_v1 root"; exit 1; }
               for d in $ROBOT_SETS; do
                 for f in meta/info.json meta/tasks.jsonl meta/episodes.jsonl meta/modality.json; do test -s "$d/$f" || { echo "FATAL $d/$f missing"; exit 1; }; done

@@ -1,5 +1,5 @@
 # openarm_wam_v1 ROBOT-ONLY (6 robot subsets, no human) for FastWAM — identical to openarm_wan22_5b.yaml minus the 5
-# human_as_openarm28 roots: same 28-dim layout, 25 obs / 24 actions at native fps with video stride 3, vertical 384x256
+# human roots (the launcher/yaml gates grep this file for the human root path, comments included): same 28-dim layout, 25 obs / 24 actions at native fps with video stride 3, vertical 384x256
 # canvas, 'moderate' aug, arms relative to state[t0] + neck/hands absolute, TRUE global q01/q99 from the SAME
 # dataset_stats.true_global.json (it was computed over robot frames only, so it is the correct file here too),
 # has_action = True for every sample, banana's absent groups masked per-dim. Single group -> plain epoch sampler.

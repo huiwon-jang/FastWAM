@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--expect-frames", default=None, help="num_frames/ratio, e.g. 25/3")
     ap.add_argument("--expect-group-fractions", default=None, help="e.g. 0.5,0.5")
     ap.add_argument("--expect-relative-dims", default=None, help="e.g. 2,16 (OpenArmRelativeArmTransform.relative_dims)")
+    ap.add_argument("--expect-no-human", action="store_true", help="composed dataset_dirs must contain no human root (path or wam_human.json marker)")
+    ap.add_argument("--expect-human-subsets", type=int, default=None, help="exact number of human-marked subsets in the composed dataset_dirs (needs --check-meta)")
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
     overrides = [o for o in args.overrides if o != "--"]
@@ -129,6 +131,10 @@ def main():
     if args.expect_video_size is not None:
         eh, ew = (int(v) for v in args.expect_video_size.lower().split("x"))
         check([h, w] == [eh, ew], f"video_size {d['video_size']} != {args.expect_video_size}")
+    if args.expect_no_human:
+        human_dirs = [r for r in d["dataset_dirs"] if "human_as_openarm28" in str(r) or "/human/" in str(r)]
+        check(not human_dirs, f"composed dataset_dirs contain human roots: {human_dirs}")
+        check(len(d["dataset_dirs"]) == 6 and all("/robot/" in str(r) for r in d["dataset_dirs"]), f"robot-only run must compose exactly 6 robot roots, got {d['dataset_dirs']}")
     if args.check_meta:
         is_openarm = "openarm" in str(d["_target_"])
         if is_openarm:
@@ -148,6 +154,12 @@ def main():
             print(f"[compose] meta: {root} codebase={meta.info['codebase_version']} fps={meta.fps} episodes={meta.total_episodes} frames={meta.total_frames} tasks={len(meta.tasks)} video_keys={meta.video_keys}" + (f" human={meta.is_human} action_dims={int(meta.action_dim_mask.sum())}" if is_openarm else ""))
         if is_openarm:
             print(f"[compose] openarm subsets: {len(d['dataset_dirs'])} (human {n_human}, robot {len(d['dataset_dirs']) - n_human})")
+            if args.expect_no_human:
+                check(n_human == 0, f"{n_human} subsets carry the wam_human.json marker in a robot-only run")
+            if args.expect_human_subsets is not None:
+                check(n_human == args.expect_human_subsets, f"human subsets {n_human} != {args.expect_human_subsets}")
+    elif args.expect_no_human or args.expect_human_subsets is not None:
+        print("[compose] note: --expect-no-human/--expect-human-subsets marker check needs --check-meta (path check done)")
     proc = instantiate(cfg.data.train.processor)  # light: no model, no dataset
     check(proc.action_output_dim == proc_a and proc.proprio_output_dim == proc_s, f"processor dims != ({proc_a},{proc_s})")
     print(

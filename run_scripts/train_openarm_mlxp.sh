@@ -138,10 +138,13 @@ for d in $ROBOT_SETS $HUMAN_SETS; do
 done
 for d in $HUMAN_SETS; do grep -q '"human": true' "$d/meta/wam_human.json" || fatal "$d is not marked human"; done
 if [ "$ROBOT_ONLY" = 1 ]; then
-  grep -q "human_as_openarm28" "configs/task/$TASK.yaml" "configs/data/openarm_robot_wan22_5b.yaml" && fatal "robot-only task must not reference human subsets"
+  # non-comment lines only (a comment mentioning the human root path is not a reference)
+  grep -h -v '^[[:space:]]*#' "configs/task/$TASK.yaml" "configs/data/openarm_robot_wan22_5b.yaml" | grep -q "human_as_openarm28" && fatal "robot-only task must not reference human subsets"
+  COMPOSE_EXTRA=(--expect-no-human)
   grep -q "openarm_robot_wan22_5b" "configs/task/$TASK.yaml" || fatal "ROBOT_ONLY=1 but task $TASK does not use data=openarm_robot_wan22_5b"
 else
   grep -q "openarm_robot_wan22_5b" "configs/task/$TASK.yaml" && fatal "task $TASK is robot-only but ROBOT_ONLY is not set"
+  COMPOSE_EXTRA=(--expect-human-subsets 5)
 fi
 for d in $ROBOT_SETS; do test -f "$d/meta/wam_human.json" && fatal "$d is marked human but listed as robot"; done
 test -f "$OA/robot/banana_v21_openarm28/meta/wam_action_groups.json" || fatal "banana lacks meta/wam_action_groups.json"
@@ -193,7 +196,7 @@ NCACHE=$(ls "$FASTWAM_OPENARM_TEXT_CACHE" | grep -c '\.t5_len128\.wan22ti2v5b\.p
 python scripts/compose_check.py --task "$TASK" --world "$NUM_GPUS" --expect-effective "$EXPECT_EFF" --check-paths --check-meta \
   --expect-fps 20,30 --expect-raw-dims 28,28 --expect-proc-dims 28,28 --expect-layout vertical --expect-video-size 384x256 \
   --expect-lr 1e-4 --expect-wd 0.01 --expect-warmup 2500 --expect-min-lr-ratio 0.1 --expect-max-steps "$MAX_STEPS" \
-  --expect-frames 25/3 --expect-group-fractions "$GROUP_FRACTIONS_EXPECT" --expect-relative-dims 2,16 --expect-aug moderate -- \
+  --expect-frames 25/3 --expect-group-fractions "$GROUP_FRACTIONS_EXPECT" --expect-relative-dims 2,16 --expect-aug moderate "${COMPOSE_EXTRA[@]}" -- \
   batch_size="$PER_DEV" gradient_accumulation_steps="$GA" model.mot_checkpoint_mixed_attn="$GC" \
   max_steps="$MAX_STEPS" save_every="$SAVE_EVERY" save_total_limit="$SAVE_LIMIT" num_workers="$NW" \
   learning_rate=1e-4 warmup_steps=2500 min_lr_ratio=0.1 weight_decay=1e-2 || fatal "compose gate (unification self-check)"
