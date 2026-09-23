@@ -31,7 +31,17 @@ CKPT_BASE="${CKPT_BASE:-/data/huiwon/checkpoints/fastwam_base}"
 MODEL_OUTPUT_DIR="${MODEL_OUTPUT_DIR:-/data/rlwrld-unified-checkpoints/huiwon/fastwam}"
 OA="${OPENARM_DATA_ROOT:-/data/huiwon/data/openarm_wam_v1}"
 ROBOT_SETS="$OA/robot/openarm_ego_jungwook $OA/robot/openarm_teleop_v3/bottle $OA/robot/openarm_teleop_v3/cup $OA/robot/openarm_teleop_v3/doll $OA/robot/openarm_teleop_v3/snack $OA/robot/banana_v21_openarm28"
-HUMAN_SETS="$OA/human_as_openarm28/rlwrld_human_lerobot $OA/human_as_openarm28/openarm_validation_v2_junhyeong/close_air_fryer $OA/human_as_openarm28/openarm_validation_v2_junhyeong/left_hand_box_white_container $OA/human_as_openarm28/openarm_validation_v2_junhyeong/open_air_fryer $OA/human_as_openarm28/anyh2r"
+# ROBOT_ONLY=1 (robot-only task, e.g. openarm_robot_fastwam_5b_b32_50k): no human subsets, no human gates, plain sampler
+ROBOT_ONLY="${ROBOT_ONLY:-0}"
+if [ "$ROBOT_ONLY" = 1 ]; then
+  HUMAN_SETS=""
+  GROUP_FRACTIONS_EXPECT="1.0"
+else
+  HUMAN_SETS="$OA/human_as_openarm28/rlwrld_human_lerobot $OA/human_as_openarm28/openarm_validation_v2_junhyeong/close_air_fryer $OA/human_as_openarm28/openarm_validation_v2_junhyeong/left_hand_box_white_container $OA/human_as_openarm28/openarm_validation_v2_junhyeong/open_air_fryer $OA/human_as_openarm28/anyh2r"
+  GROUP_FRACTIONS_EXPECT="0.5,0.5"
+fi
+# plate: L0 per-device batch (default 16 for the rh run = 8 robot + 8 human; the robot-only b32 run uses 8)
+PLATE_PD0="${PLATE_PD0:-16}"; [[ "$PLATE_PD0" =~ ^[0-9]+$ ]] && [ $(( PLATE_PD0 % 4 )) -eq 0 ] || { echo "PLATE_PD0=$PLATE_PD0 must be a multiple of 4"; exit 1; }
 
 mkdir -p "$LOG_DIR"
 if [ -z "${FASTWAM_LOG_PREFIX:-}" ]; then
@@ -43,7 +53,7 @@ fi
 echo "[$TAG] launcher START $(date -u +%FT%TZ) host=$(hostname) log=$L.{out,err}"
 fatal() { echo "[$TAG] FATAL: $*"; echo "[$TAG] rc=1 $(date -u +%FT%TZ)"; exit 1; }
 OOM_RE='CUDA out of memory|OutOfMemoryError|std::bad_alloc|Killed'
-OOM_LEVEL_FILE="$PREP_DIR/oom_level"
+OOM_LEVEL_FILE="${OOM_LEVEL_FILE:-$PREP_DIR/oom_level}"   # per-run state file (the yaml sets one per run; never shared between runs)
 OOM_LEVEL_MAX=3
 export WANDB_ENTITY="${WANDB_ENTITY:-huiwoen0516}" WANDB_PROJECT=fastwam WANDB_RUN_ID="$RUN_NAME" WANDB_RESUME=allow
 WANDB_MODE_OVERRIDE=()
@@ -66,10 +76,10 @@ LEVEL_FLOOR="${OOM_FALLBACK:-0}"; [[ "$LEVEL_FLOOR" =~ ^[0-9]+$ ]] || fatal "OOM
 if [ -n "${OOM_LEVEL_OVERRIDE:-}" ]; then OOM_LEVEL=$((10#$OOM_LEVEL_OVERRIDE)); fi
 [ "$OOM_LEVEL" -le "$OOM_LEVEL_MAX" ] || fatal "OOM level $OOM_LEVEL > max $OOM_LEVEL_MAX (state file $OOM_LEVEL_FILE)"
 case "$OOM_LEVEL" in
-  0) PER_DEV=16; GA=1; GC=false ;;   # default plate: 8 robot + 8 human per GPU
-  1) PER_DEV=16; GA=1; GC=true ;;    # + activation checkpointing in every MoT block
-  2) PER_DEV=8;  GA=2; GC=true ;;    # half micro-batch (4+4), 2x accumulation
-  3) PER_DEV=4;  GA=4; GC=true ;;    # quarter micro-batch (2+2), 4x accumulation
+  0) PER_DEV=$PLATE_PD0;           GA=1; GC=false ;;   # default plate (rh: 8 robot + 8 human per GPU; robot-only b32: pd8)
+  1) PER_DEV=$PLATE_PD0;           GA=1; GC=true ;;    # + activation checkpointing in every MoT block
+  2) PER_DEV=$(( PLATE_PD0 / 2 )); GA=2; GC=true ;;    # half micro-batch, 2x accumulation
+  3) PER_DEV=$(( PLATE_PD0 / 4 )); GA=4; GC=true ;;    # quarter micro-batch, 4x accumulation
 esac
 if [ "$GA" -gt 1 ]; then
   export ALLOW_GA_GT1=1
@@ -80,7 +90,7 @@ MAX_STEPS="${MAX_STEPS:-50000}"; SAVE_EVERY="${SAVE_EVERY:-1000}"; SAVE_LIMIT="$
 EXPECT_EFF="${EXPECT_EFF:-64}"
 EFF=$(( PER_DEV * NUM_GPUS * GA ))
 [ "$EFF" -eq "$EXPECT_EFF" ] || fatal "effective batch $EFF != $EXPECT_EFF (pd$PER_DEV x $NUM_GPUS gpu x GA$GA)"
-[ $(( PER_DEV % 2 )) -eq 0 ] || fatal "per-device batch $PER_DEV must be even (exact robot/human halves)"
+if [ "$ROBOT_ONLY" != 1 ]; then [ $(( PER_DEV % 2 )) -eq 0 ] || fatal "per-device batch $PER_DEV must be even (exact robot/human halves)"; fi
 if [ "$GA" -gt 1 ] && [ "${ALLOW_GA_GT1:-0}" != 1 ]; then
   fatal "GA=$GA > 1 refused with the pinned deepspeed (set ALLOW_GA_GT1=1 after verifying / upgrading deepspeed >= 0.19.6)"
 fi
@@ -114,7 +124,7 @@ python -m py_compile scripts/train.py scripts/precompute_text_embeds.py scripts/
   src/fastwam/trainer.py src/fastwam/runtime.py src/fastwam/utils/samplers.py src/fastwam/models/wan22/fastwam.py \
   src/fastwam/datasets/lerobot/robot_video_dataset.py src/fastwam/datasets/lerobot/openarm_dataset.py \
   src/fastwam/datasets/lerobot/transforms/openarm.py src/fastwam/datasets/lerobot/processors/openarm_processor.py || fatal "python syntax"
-for f in configs/task/$TASK.yaml configs/data/openarm_wan22_5b.yaml configs/model/fastwam_droid.yaml \
+for f in configs/task/$TASK.yaml configs/data/openarm_wan22_5b.yaml configs/data/openarm_robot_wan22_5b.yaml configs/model/fastwam_droid.yaml \
          scripts/accelerate_configs/accelerate_zero1_ds.yaml scripts/ds_configs/ds_zero1_config.json; do
   test -s "$f" || fatal "missing config $f"
 done
@@ -127,6 +137,12 @@ for d in $ROBOT_SETS $HUMAN_SETS; do
   test -s "$d/meta/info.json" && test -s "$d/meta/tasks.jsonl" && test -d "$d/videos/chunk-000" && test -d "$d/data/chunk-000" || fatal "dataset root unreadable: $d"
 done
 for d in $HUMAN_SETS; do grep -q '"human": true' "$d/meta/wam_human.json" || fatal "$d is not marked human"; done
+if [ "$ROBOT_ONLY" = 1 ]; then
+  grep -q "human_as_openarm28" "configs/task/$TASK.yaml" "configs/data/openarm_robot_wan22_5b.yaml" && fatal "robot-only task must not reference human subsets"
+  grep -q "openarm_robot_wan22_5b" "configs/task/$TASK.yaml" || fatal "ROBOT_ONLY=1 but task $TASK does not use data=openarm_robot_wan22_5b"
+else
+  grep -q "openarm_robot_wan22_5b" "configs/task/$TASK.yaml" && fatal "task $TASK is robot-only but ROBOT_ONLY is not set"
+fi
 for d in $ROBOT_SETS; do test -f "$d/meta/wam_human.json" && fatal "$d is marked human but listed as robot"; done
 test -f "$OA/robot/banana_v21_openarm28/meta/wam_action_groups.json" || fatal "banana lacks meta/wam_action_groups.json"
 test -d "$CKPT_BASE/Wan-AI/Wan2.2-TI2V-5B" || fatal "weight base layout missing under $CKPT_BASE"
@@ -155,8 +171,9 @@ if [ ! -s "$STATS_JSON" ]; then
 else
   echo "[$TAG] prep(b): stats present: $STATS_JSON"
 fi
-python -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('huiwon_true_global_quantiles') is True and len(d['action']['default']['global_q01'])==28 and d['huiwon_true_global_quantiles_meta'].get('skipped_human_roots') else 1)" "$STATS_JSON" \
-  || fatal "$STATS_JSON lacks the marker huiwon_true_global_quantiles=true / 28 dims / human-exclusion meta; rebuild with scripts/compute_openarm_true_global_stats.py"
+# gate: marker + 28 dims + exactly the 6 robot roots (the SAME file serves the rh and the robot-only runs: human never entered it)
+python -c "import json,sys; d=json.load(open(sys.argv[1])); m=d['huiwon_true_global_quantiles_meta']; sys.exit(0 if d.get('huiwon_true_global_quantiles') is True and len(d['action']['default']['global_q01'])==28 and len(m.get('roots',[]))==6 and not any('human_as_openarm28' in r['root'] for r in m['roots']) else 1)" "$STATS_JSON" \
+  || fatal "$STATS_JSON lacks the marker huiwon_true_global_quantiles=true / 28 dims / 6 robot-only roots; rebuild with scripts/compute_openarm_true_global_stats.py"
 echo "[$TAG] stats: TRUE global q01/q99 (robot-only, huiwon override) from $STATS_JSON"
 export FASTWAM_OPENARM_STATS="$STATS_JSON"
 TXT_DONE="$FASTWAM_OPENARM_TEXT_CACHE/.precompute_done"
@@ -176,7 +193,7 @@ NCACHE=$(ls "$FASTWAM_OPENARM_TEXT_CACHE" | grep -c '\.t5_len128\.wan22ti2v5b\.p
 python scripts/compose_check.py --task "$TASK" --world "$NUM_GPUS" --expect-effective "$EXPECT_EFF" --check-paths --check-meta \
   --expect-fps 20,30 --expect-raw-dims 28,28 --expect-proc-dims 28,28 --expect-layout vertical --expect-video-size 384x256 \
   --expect-lr 1e-4 --expect-wd 0.01 --expect-warmup 2500 --expect-min-lr-ratio 0.1 --expect-max-steps "$MAX_STEPS" \
-  --expect-frames 25/3 --expect-group-fractions 0.5,0.5 --expect-relative-dims 2,16 --expect-aug moderate -- \
+  --expect-frames 25/3 --expect-group-fractions "$GROUP_FRACTIONS_EXPECT" --expect-relative-dims 2,16 --expect-aug moderate -- \
   batch_size="$PER_DEV" gradient_accumulation_steps="$GA" model.mot_checkpoint_mixed_attn="$GC" \
   max_steps="$MAX_STEPS" save_every="$SAVE_EVERY" save_total_limit="$SAVE_LIMIT" num_workers="$NW" \
   learning_rate=1e-4 warmup_steps=2500 min_lr_ratio=0.1 weight_decay=1e-2 || fatal "compose gate (unification self-check)"
@@ -203,7 +220,8 @@ if [ -n "$RESUME_DIR" ]; then
   RESUME_ARGS=("resume=$RESUME_DIR")
 fi
 
-echo "[$TAG] BANNER oom_level=L$OOM_LEVEL eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} (robot $((PER_DEV/2)) + human $((PER_DEV/2)) per GPU) | grad_ckpt=$GC | lr=1e-4 warmup=2500 min_lr=0.1xLR wd=0.01 aug=moderate(0.9/5/0.2) | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | stats=true-global-q01q99(robot-only, huiwon override) | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
+if [ "$ROBOT_ONLY" = 1 ]; then MIX="robot-only, plain sampler"; else MIX="robot $((PER_DEV/2)) + human $((PER_DEV/2)) per GPU"; fi
+echo "[$TAG] BANNER oom_level=L$OOM_LEVEL eff_batch=$EFF = ${NUM_GPUS}gpu x pd${PER_DEV} x GA${GA} ($MIX) | grad_ckpt=$GC | lr=1e-4 warmup=2500 min_lr=0.1xLR wd=0.01 aug=moderate(0.9/5/0.2) | max_steps=$MAX_STEPS save_every=$SAVE_EVERY keep=$SAVE_LIMIT nw=$NW | stats=true-global-q01q99(robot-only, huiwon override) | resume=${RESUME_DIR:-fresh(step 0)} | out=$OUTPUT_DIR"
 
 accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \

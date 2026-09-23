@@ -1,0 +1,76 @@
+# openarm_wam_v1 ROBOT-ONLY (6 robot subsets, no human) for FastWAM — identical to openarm_wan22_5b.yaml minus the 5
+# human_as_openarm28 roots: same 28-dim layout, 25 obs / 24 actions at native fps with video stride 3, vertical 384x256
+# canvas, 'moderate' aug, arms relative to state[t0] + neck/hands absolute, TRUE global q01/q99 from the SAME
+# dataset_stats.true_global.json (it was computed over robot frames only, so it is the correct file here too),
+# has_action = True for every sample, banana's absent groups masked per-dim. Single group -> plain epoch sampler.
+train:
+  _target_: fastwam.datasets.lerobot.openarm_dataset.OpenArmRobotVideoDataset
+  dataset_dirs:
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/openarm_ego_jungwook
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/openarm_teleop_v3/bottle
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/openarm_teleop_v3/cup
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/openarm_teleop_v3/doll
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/openarm_teleop_v3/snack
+    - ${oc.env:OPENARM_DATA_ROOT,/data/huiwon/data/openarm_wam_v1}/robot/banana_v21_openarm28
+  shape_meta:
+    images:
+      - key: camera_ego_left           # -> observation.images.camera_ego_left (banana alias observation.image.ego_left); canvas TOP
+        raw_shape: [3, 192, 256]
+        shape: [3, 192, 256]
+      - key: camera_ego_right          # -> observation.images.camera_ego_right (alias observation.image.ego_right); canvas BOTTOM
+        raw_shape: [3, 192, 256]
+        shape: [3, 192, 256]
+    action:
+      - key: default                   # -> "action", 28-dim raw
+        raw_shape: 28
+        shape: 28                      # after OpenArmRelativeArmTransform: rel arms [2:16] + abs neck/hands
+    state:
+      - key: default                   # -> "observation.state", 28-dim absolute
+        raw_shape: 28
+        shape: 28
+  num_frames: 25
+  global_sample_stride: 1
+  action_video_freq_ratio: 3           # 24 actions, 9 video frames (frame stride 3 at native fps)
+  video_size: [384, 256]               # final canvas (H, W) = 2 x 192 (vertical) x 256; multiples of 32
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  # launcher exports FASTWAM_OPENARM_STATS=/data/huiwon/data/openarm_fastwam/dataset_stats.true_global.json (TRUE global
+  # q01/q99 over robot frames only, marker huiwon_true_global_quantiles). The dataset class REFUSES any other file.
+  pretrained_norm_stats: ${oc.env:FASTWAM_OPENARM_STATS,null}
+  skip_padding_as_possible: false
+  concat_multi_camera: "vertical"
+  group_fractions: [1.0]               # single (robot) group -> the dataset disables the balanced sampler (plain epoch sampler)
+  max_episodes_per_dir: null           # debug knob (CPU smoke)
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.openarm_processor.OpenArmProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 2
+    action_output_dim: 28
+    proprio_output_dim: 28
+    delta_action_dim_mask: null        # padded-step zeroing of the relative arm dims is done by the transform
+    action_state_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.openarm.OpenArmRelativeArmTransform
+        keys: [default]
+        relative_dims: [2, 16]
+        zero_padded_relative: true
+    use_stepwise_action_norm: false
+    norm_default_mode: q01/q99
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    # 'moderate' aug of our OpenArm WAM runs (ALLVIEW): per view, rotate +-5 deg -> random crop 0.9 area -> resize back
+    # -> brightness/contrast/saturation x U(0.8, 1.2). FastWAM/DROID port has no aug; this transform adds it.
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: fastwam.datasets.lerobot.transforms.openarm_aug.OpenArmModerateAug
+        crop_area: 0.9
+        rotate_deg: 5.0
+        jitter: 0.2
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+  text_embedding_cache_dir: ${oc.env:FASTWAM_OPENARM_TEXT_CACHE,/data/huiwon/data/openarm_fastwam/text_embeds_cache}
+  use_text_embed_cache: true
+  context_len: 128
+  video_backend: ${oc.env:FASTWAM_VIDEO_BACKEND,torchcodec}

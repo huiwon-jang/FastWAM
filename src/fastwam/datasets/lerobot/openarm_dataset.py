@@ -453,8 +453,18 @@ class OpenArmRobotVideoDataset(RobotVideoDataset):
         keys = [m["key"] for m in self.lerobot_dataset.image_meta]
         if keys != ["camera_ego_left", "camera_ego_right"]:
             raise ValueError(f"OpenArm shape_meta.images must be [camera_ego_left, camera_ego_right] in this order, got {keys}")
-        self.batch_group_ids = self.lerobot_dataset.sample_group_ids
-        self.batch_group_fractions = [float(v) for v in group_fractions]
+        groups_present = sorted(int(g) for g in np.unique(self.lerobot_dataset.sample_group_ids))
+        if len(groups_present) == 1:
+            # single group (robot-only or human-only mixture): no per-batch composition to enforce -> the trainer
+            # falls back to the plain ResumableEpochSampler (batch_group_ids=None)
+            self.batch_group_ids = None
+            self.batch_group_fractions = None
+            logger.info("[openarm] single group %s present -> plain epoch sampler (group_fractions %s ignored)", groups_present, list(group_fractions))
+        else:
+            if len(group_fractions) != len(groups_present):
+                raise ValueError(f"group_fractions {list(group_fractions)} must have one entry per group present {groups_present}")
+            self.batch_group_ids = self.lerobot_dataset.sample_group_ids
+            self.batch_group_fractions = [float(v) for v in group_fractions]
         self._text_cache: Dict[str, Any] = {}
 
     def _base_dataset_extra_kwargs(self):
