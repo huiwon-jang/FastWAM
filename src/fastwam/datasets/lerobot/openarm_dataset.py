@@ -344,11 +344,14 @@ class OpenArmLerobotDataset(BaseLerobotDataset):
         metas = [self.metadata_cls(repo_id=d, root=Path(d)) for d in self.dataset_dirs]
         episodes = {}
         for meta in metas:
+            # episode ids come from meta/episodes.jsonl, NOT range(total_episodes): rlwrld_human_lerobot dropped 7
+            # episodes (wam_human.json dropped_episodes) so its ids run 0..478 with gaps while total_episodes is 472
+            all_eps = sorted(int(e) for e in meta.episodes.keys())
             if val_set_proportion < 1e-6:
-                eps = list(range(meta.total_episodes))
+                eps = list(all_eps)
             else:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
-                eps = list(range(meta.total_episodes))
+                split_idx = int(len(all_eps) * (1 - val_set_proportion))
+                eps = list(all_eps)
                 np.random.default_rng(seed).shuffle(eps)
                 eps = eps[:split_idx] if is_training_set else eps[split_idx:]
             if max_episodes_per_dir is not None:

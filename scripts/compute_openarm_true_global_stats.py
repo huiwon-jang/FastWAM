@@ -55,9 +55,13 @@ def subset_info(root: Path):
             for g in groups:
                 a, b = GROUPS[g]
                 mask[a:b] = True
-    n_ep = int(info["total_episodes"])
     chunks = int(info["chunks_size"])
-    paths = [root / info["data_path"].format(episode_chunk=e // chunks, episode_index=e) for e in range(n_ep)]
+    # episode ids from meta/episodes.jsonl (ids may have gaps, e.g. dropped episodes), not range(total_episodes)
+    ep_ids = sorted(int(json.loads(l)["episode_index"]) for l in open(root / "meta" / "episodes.jsonl") if l.strip())
+    paths = [root / info["data_path"].format(episode_chunk=e // chunks, episode_index=e) for e in ep_ids]
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"{root}: {len(missing)} parquet files listed in episodes.jsonl are missing, e.g. {missing[:3]}")
     return info, human, mask, paths
 
 
